@@ -9,6 +9,9 @@ import json
 import time
 import pprint
 from datetime import datetime, timedelta
+from ace_api import Alert
+import logging
+import logging.config
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -18,11 +21,19 @@ class QIt():
       self.config.read('qit.ini')
       self.new_items = {}
       self.proxies = None
-      if self.config['proxy']['enabled']:
+      if bool(self.config['proxy']['enabled']):
          self.proxies = {
             "http": self.config['proxy']['http_proxy'],
             "https" : self.config['proxy']['https_proxy']
          }
+      if bool(self.config['ace']['enabled']):
+         self.rule_name = self.config['ace']['rule_name']
+         self.alert_type = self.config['ace']['alert_type']
+         self.tool = self.config['ace']['tool']
+         self.company_id = self.config['ace']['company_id']
+         self.company_name = self.config['ace']['company_name']
+         self.tags = self.config['ace']['tags']
+         #self.alert_remotehost = self.config['ace']['remote_host']
       # only show last X days of matching items (only care about new sites/domains/urls)
       self.days = int(self.config['config']['lookback_days'])
       self.search_filename = search_file
@@ -34,12 +45,19 @@ class QIt():
       
    def run(self):
       self.run_urlquery()
+      try:
+         
+         if bool(self.config['ace']['enabled']):
+            self.submit_alert()
+         self.update_known_file()
+      except Exception as e:
+          logging.error("unable to complete submitting and saving new data", str(e))
 
    def get_date(self,datestring):
       # assumes this format of data - "2018-09-04T15:45:11.971Z" - which is what urlquery uses
       # just getting the day is sufficient
       datestring = datestring[0:datestring.index('T')]
-      return datetime.strptime(datestring,"%Y-%M-%d")
+      return datetime.strptime(datestring,"%Y-%m-%d")
 
    def is_recent(self,datestring):
       dt = self.get_date(datestring)
@@ -71,7 +89,7 @@ class QIt():
          search = item['item']
          print(search)
          param = ( 'q', search)
-         if self.config['proxy']['enabled']:
+         if bool(self.config['proxy']['enabled']):
             response = requests.get('http://urlscan.io/api/v1/search/?q={}'.format(search), proxies=self.proxies, verify=False)
          else:
             response = requests.get('http://urlscan.io/api/v1/search/?q={}'.format(search))
@@ -79,27 +97,57 @@ class QIt():
             
          self.new_items.update(self.diff_known_search(search,r['results']))
 
-      new_known = False
-      if self.new_items is not None:
-         for item in self.new_items:
-            tmp = {}
-            tmp[item] = { 'search' : self.new_items[item]['search'],
-                          'domain' : self.new_items[item]['page']['domain'],
-                          'time'   : self.new_items[item]['task']['time'],
-                          'url'    : self.new_items[item]['task']['url'] }
-            print(tmp[item])
+   def update_known_file(self):
+      for item in self.new_items:
+         tmp = {}
+         tmp[item] = { 'search' : self.new_items[item]['search'],
+                       'domain' : self.new_items[item]['page']['domain'],
+                       'time'   : self.new_items[item]['task']['time'],
+                       'url'    : self.new_items[item]['task']['url'] }
+         pprint.pprint(tmp[item])
             
-            self.known_file['known'].append(tmp[item])
-            new_known = True
-            #self.print_url_json(url,r['results'])
+         self.known_file['known'].append(tmp[item])
+         new_known = True
 
-      if new_known:
-         #self.known_file['known'].append(new_known)
-         pprint.pprint(self.known_file)
-         with open(self.known_filename, 'w') as outfile:
-           json.dump(self.known_file, outfile)
+      with open(self.known_filename, 'w') as outfile:
+        json.dump(self.known_file, outfile)
         
       
+   def submit_alert(self):
+      for item in self.new_items:
+         # format is 2018-09-04T15:45:11.971Z
+         datestring = self.new_items[item]['task']['time']
+         mdy = datestring[0:datestring.index('T')]
+         hms = datestring[datestring.index('T')+1:datestring.index('.')]
+         newds = '{} {}'.format(mdy,hms)
+         #dt = datetime.strptime(newds,"%Y-%M-%d %H:%M:%S")
+         alert_title = '{} - {}'.format(self.new_items[item]['task']['url'],self.new_items[item]['task']['time'])   
+
+         alert = Alert(
+             tool=self.tool,
+             tool_instance=self.tool,
+             alert_type=self.alert_type,
+             desc=alert_title,
+             event_time=datestring,
+             details=item,
+             name=self.rule_name,
+             company_name=self.company_name,
+             company_id=self.company_id
+         )
+         for x in self.tags.split(','):
+            alert.add_tag(x)
+         alert.add_observable('fqdn',self.new_items[item]['page']['domain'],None)
+         alert.add_observable('url',self.new_items[item]['task']['url'],None) 
+         print(Alert)
+
+         logging.info("submitting alert {}".format(alert.description))
+         #print(self.alert_remotehost)
+         for env_var in [ 'http_proxy', 'https_proxy', 'ftp_proxy' ]:
+            if env_var in os.environ:
+                del os.environ[env_var]
+         alert.submit()
+         logging.info("submitted alert {}".format(alert.description))
+             
 
 if __name__ == "__main__":
 
@@ -114,7 +162,17 @@ if __name__ == "__main__":
       help='json template for searches')
    parser.add_argument('-f', '--file', required=False, dest='inputfile',
       help="input file of query values, 1 per line, add quotes if literals needed") 
+   parser.add_argument('--logging-config', required=False, default='logging.ini', dest='logging_config',
+        help="Path to logging configuration file.  Defaults to logging.ini")
    args = parser.parse_args()
+
+   # initialize logging
+   try:
+      logging.config.fileConfig(args.logging_config)
+   except Exception as e:
+      sys.stderr.write("ERROR: unable to load logging config from {0}: {1}".format(
+      args.logging_config, str(e)))
+      sys.exit(1)
 
    if args.printtemplate:
       jsearchformat = {
